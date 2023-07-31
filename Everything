@@ -1,0 +1,693 @@
+#include <SDL.h>
+#include <stdio.h>
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <chrono>
+#include <random>
+#include <math.h>
+
+using namespace std;
+
+//Random number generator
+unsigned seed = chrono::system_clock::now().time_since_epoch() / chrono::microseconds(1) % 1000000;
+default_random_engine rnd(seed);
+uniform_real_distribution<float> rndFloatMod1(-1.0, 1.0);
+uniform_real_distribution<float> rndFloat01(0.0, 1.0);
+uniform_real_distribution<float> rndFloatModPi(-M_PI, M_PI);
+uniform_real_distribution<float> rndMutFactor(-0.0000001, 0.0000001);
+
+//Window parameters
+const int FPS = 40;
+const int WIDTH = 600;
+const int HEIGHT = 600;
+
+//Simulation parameters
+const string SAVE_FILE_NAME = "Testing.txt";
+bool RESTART = false;
+bool SAVE = true;
+bool VISUALIZE = true;
+const int MAX_ORG_N = 500;
+const int MAX_SURV_N = 250;
+const int GENERATION_LIFETIME = 100;
+
+//Organism parameters
+const float V_MOD_CAP = 10.0;
+const float MAX_LIN_ACC = 2.5;
+const float W_MOD_CAP = M_PI / 4.0;
+const float MAX_ANG_ACC = M_PI / 16.0;
+const int ORGANISM_INPUT_SIZE = 5;
+const int ORGANISM_INNER_SIZE = 8;
+const int ORGANISM_OUTPUT_SIZE = 2;
+const int ORGANISM_RADIUS = 6;
+
+//Inner variables
+int tickCnt = 0;
+long long tickCap = int(1000 / FPS);
+long long start, tickTime;
+
+
+//Functions
+int randSign() {
+	if (rnd() % 2 == 0) {
+		return 1;
+	}
+	else {
+		return -1;
+	}
+}
+
+bool randBool() {
+	if (rnd() % 2 == 0) {
+		return true;
+	}
+	else {
+		return false;
+	}
+}
+
+int RandDistrAround(int center, int radius) {
+	return center + rnd() % (2 * radius) - radius;
+}
+
+float ReLU(float x) {
+	if (x > 0) {
+		return x;
+	}
+	else {
+		return 0.0;
+	}
+}
+
+float FastSigm(float x) {
+	return x / (1 + abs(x));
+}
+
+int GetMaxId(float* arr, int len) {
+	if (len < 2) {
+		return 0;
+	}
+	int id = 0;
+	float max = arr[0];
+	for (int i = 1; i != len; i++) {
+		if (arr[i] > max) {
+			max = arr[i];
+			id = i;
+		}
+	}
+	return id;
+}
+
+void FillScreen(SDL_Renderer* rend, int r, int g, int b) {
+	SDL_SetRenderDrawColor(rend, r, g, b, 255);
+	SDL_RenderClear(rend);
+}
+
+void DrawEmptyCircle(SDL_Renderer* renderer, int centreX, int centreY, int radius) {
+	const int diameter = (radius * 2);
+	int x = (radius - 1);
+	int y = 0;
+	int tx = 1;
+	int ty = 1;
+	int error = (tx - diameter);
+
+	while (x >= y) {
+		//  Each of the following renders an octant of the circle
+		SDL_RenderDrawPoint(renderer, centreX + x, centreY - y);
+		SDL_RenderDrawPoint(renderer, centreX + x, centreY + y);
+		SDL_RenderDrawPoint(renderer, centreX - x, centreY - y);
+		SDL_RenderDrawPoint(renderer, centreX - x, centreY + y);
+		SDL_RenderDrawPoint(renderer, centreX + y, centreY - x);
+		SDL_RenderDrawPoint(renderer, centreX + y, centreY + x);
+		SDL_RenderDrawPoint(renderer, centreX - y, centreY - x);
+		SDL_RenderDrawPoint(renderer, centreX - y, centreY + x);
+
+		if (error <= 0) {
+			++y;
+			error += ty;
+			ty += 2;
+		}
+
+		if (error > 0) {
+			--x;
+			tx += 2;
+			error += (tx - diameter);
+		}
+	}
+}
+
+void DrawFilledCircle(SDL_Renderer* rend, int x, int y, int rad, int r, int g, int b) {
+	SDL_SetRenderDrawColor(rend, r, g, b, 255);
+	for (int i = x - rad - 1; i != x + rad + 1; i++) {
+		for (int j = y - rad - 1; j != y + rad + 1; j++) {
+			if ((x - i) * (x - i) + (y - j) * (y - j) <= rad * rad) {
+				SDL_RenderDrawPoint(rend, i, j);
+			}
+		}
+	}
+}
+
+
+//Structures
+struct Layer {
+	int inS, outS;
+	float** weights;
+	float* biases;
+	float* outArr;
+
+	Layer(int inputSize, int outputSize) {
+		inS = inputSize;
+		outS = outputSize;
+
+		weights = new float* [outS];
+		for (int i = 0; i < outS; i++) {
+			weights[i] = new float[inS];
+			for (int j = 0; j < inS; j++) {
+				weights[i][j] = 0.0;
+			}
+		}
+
+		biases = new float[outS];
+		for (int i = 0; i < outS; i++) {
+			biases[i] = 0.0;
+		}
+
+		outArr = new float[outS];
+		for (int i = 0; i < outS; i++) {
+			outArr[i] = 0.0;
+		}
+	}
+
+	~Layer() {
+		for (int i = 0; i != outS; i++) {
+			delete[] weights[i];
+		}
+		delete[] weights;
+		delete[] biases;
+		delete[] outArr;
+	}
+
+	void SetRandW() {
+		for (int i = 0; i < outS; i++) {
+			for (int j = 0; j < inS; j++) {
+				weights[i][j] = rndFloatMod1(rnd);
+			}
+		}
+	}
+
+	void SetRandB() {
+		for (int i = 0; i < outS; i++) {
+			biases[i] = rndFloatMod1(rnd);
+		}
+	}
+
+	void Process(float* inArr) {
+		float sum;
+		for (int i = 0; i < outS; i++) {
+			sum = biases[i];
+			for (int j = 0; j < inS; j++) {
+				sum += inArr[j] * weights[i][j];
+			}
+			outArr[i] = FastSigm(sum);
+		}
+	}
+
+};
+
+struct Organism {
+	int infoS, innerS, decS;
+	float x, y, angleX, v, w;
+	float* innerArr;
+	float* decArr;
+	Layer* layer1;
+	Layer* layer2;
+
+	Organism(int infoS, int innerS, int decS, float x, float y, float angleX = 0.0, float v = 0.0, float w = 0.0) {
+		this->infoS = infoS;
+		this->innerS = innerS;
+		this->decS = decS;
+
+		this->x = x;
+		this->y = y;
+		this->angleX = angleX;
+		this->v = v;
+		this->w = w;
+
+		layer1 = new Layer(infoS, innerS);
+		layer1->SetRandW();
+		layer1->SetRandB();
+
+		layer2 = new Layer(innerS, decS);
+		layer2->SetRandW();
+		layer2->SetRandB();
+
+		innerArr = layer1->outArr;
+		decArr = layer2->outArr;
+	}
+
+	~Organism() {
+		delete layer1;
+		delete layer2;
+	}
+
+	Organism* Clone() {
+		Organism* clone = new Organism(infoS, innerS, decS, x, y, angleX, v, w);
+
+		for (int i = 0; i < innerS; i++) {
+			for (int j = 0; j < infoS; j++) {
+				clone->layer1->weights[i][j] = this->layer1->weights[i][j] * (1.0 + rndMutFactor(rnd));
+			}
+			clone->layer1->biases[i] = this->layer1->biases[i] * (1.0 + rndMutFactor(rnd));
+		}
+
+		for (int i = 0; i < decS; i++) {
+			for (int j = 0; j < innerS; j++) {
+				clone->layer2->weights[i][j] = this->layer2->weights[i][j] * (1.0 + rndMutFactor(rnd));
+			}
+			clone->layer2->biases[i] = this->layer2->biases[i] * (1.0 + rndMutFactor(rnd));
+		}
+
+		return clone;
+	}
+
+	void Draw(SDL_Renderer* rend) {
+		DrawFilledCircle(rend,
+			             int(x), WIDTH - int(y) - 1,
+			             ORGANISM_RADIUS,
+			             0, 191, 255);
+		DrawFilledCircle(rend,
+			             int(x + ORGANISM_RADIUS * cos(angleX)), WIDTH - int(y + ORGANISM_RADIUS * sin(angleX)) - 1,
+			             ORGANISM_RADIUS / 2,
+			             255, 255, 255);
+	}
+
+	void MakeDecision(float* infoArr) {
+		layer1->Process(infoArr);
+		layer2->Process(innerArr);
+
+		v += MAX_LIN_ACC * decArr[0];
+		if (v < 0) {
+			v = 0;
+		}
+		else if (v > V_MOD_CAP) {
+			v = V_MOD_CAP;
+		}
+
+		w += MAX_ANG_ACC * decArr[1];
+		if (w > W_MOD_CAP) {
+			w = W_MOD_CAP;
+		}
+		else if (w < -W_MOD_CAP) {
+			w = -W_MOD_CAP;
+		}
+	}
+
+	void PosUpd() {
+		angleX += w;
+		while (angleX > M_PI) {
+			angleX -= M_PI;
+		}
+		while (angleX < -M_PI) {
+			angleX += M_PI;
+		}
+
+		x += v * cos(angleX);
+		if (x < 0) {
+			x = 0;
+		}
+		else if (x >= WIDTH) {
+			x = WIDTH - 1;
+		}
+
+		y += v * sin(angleX);
+		if (y < 0) {
+			y = 0;
+		}
+		else if (y >= HEIGHT) {
+			y = HEIGHT - 1;
+		}
+	}
+
+};
+
+
+//Grid structure
+struct System {
+	int orgN, survN, genCnt;
+	vector<Organism*> organisms;
+	vector<Organism*> survivors;
+
+	System() {
+		orgN = 0;
+		survN = 0;
+		genCnt = 1;
+	}
+
+	~System() {
+		for (int i = 0; i != orgN; i++) {
+			delete organisms[i];
+		}
+		for (int i = 0; i != survN; i++) {
+			delete survivors[i];
+		}
+	}
+
+	void Draw(SDL_Renderer* rend) {
+		SDL_SetRenderDrawColor(rend, 152, 251, 152, 255);
+		for (int x = 0; x != WIDTH; x++) {
+			for (int y = 0; y != HEIGHT; y++) {
+				if (CoordCondition(x, y)) {
+					SDL_RenderDrawPoint(rend, x, y);
+				}
+			}
+		}
+
+		for (int i = 0; i != orgN; i++) {
+			organisms[i]->Draw(rend);
+		}
+	}
+
+	void ChangeUpdOrder() {
+		shuffle(organisms.begin(), organisms.begin() + orgN, rnd);
+	}
+
+	void Repopulate() {
+		for (int i = orgN; i != MAX_ORG_N; i++) {
+			Organism* tempOrg = new Organism(ORGANISM_INPUT_SIZE, ORGANISM_INNER_SIZE, ORGANISM_OUTPUT_SIZE,
+				0, 0, rndFloatModPi(rnd), V_MOD_CAP * rndFloat01(rnd), W_MOD_CAP * rndFloatMod1(rnd));
+			organisms.push_back(tempOrg);
+		}
+		orgN = MAX_ORG_N;
+	}
+
+	bool CoordCondition(float x, float y) {
+		return abs(x - 300) < 25 and abs(y - 300) < 25;
+	}
+
+	bool FitsCriteria(Organism* org) {
+		return CoordCondition(org->x, org->y);
+	}
+
+	void CheckSelection() {
+		Organism* temp = nullptr;
+
+		for (int i = 0; i < orgN; i++) {
+			temp = organisms[i];
+			if (FitsCriteria(temp)) {
+				survivors.push_back(temp);
+				organisms.erase(organisms.begin() + i);
+				survN++;
+				orgN--;
+				i--;
+			}
+		}
+	}
+
+	void ApplySelection() {
+		for (int i = 0; i != orgN; i++) {
+			delete organisms[i];
+		}
+		organisms.clear();
+
+		organisms = survivors;
+		orgN = survN;
+		survivors.clear();
+		survN = 0;
+		if (orgN == 0) {
+			cout << "No one survived\n";
+			Repopulate();
+			genCnt = 1;
+			return;
+		}
+
+		for (int i = orgN; i != MAX_ORG_N; i++) {
+			organisms.push_back(organisms[rnd() % orgN]->Clone());
+		}
+		orgN = MAX_ORG_N;
+
+		int x = RandDistrAround(300, 300);
+		int y = RandDistrAround(300, 300);
+		while (abs(x - 300) < 200 and abs(y - 300) < 200) {
+			x = RandDistrAround(300, 300);
+			y = RandDistrAround(300, 300);
+		}
+		for (int i = 0; i != orgN; i++) {
+			organisms[i]->x = x;
+			organisms[i]->y = y;
+			organisms[i]->angleX = rndFloatModPi(rnd);
+			organisms[i]->v = V_MOD_CAP * rndFloat01(rnd);
+			organisms[i]->w = W_MOD_CAP * rndFloatMod1(rnd);
+		}
+
+		genCnt++;
+	}
+
+	void CompriseInfoArr(Organism* org, float* infoArr) {
+		infoArr[0] = org->x * 2.0 / WIDTH - 1.0;
+		infoArr[1] = org->y * 2.0 / HEIGHT - 1.0;
+		infoArr[2] = org->angleX / M_PI;
+		infoArr[3] = org->v / V_MOD_CAP;
+		infoArr[4] = org->w / W_MOD_CAP;
+	}
+
+	void Update() {
+		float infoArr[ORGANISM_INPUT_SIZE] = { 0.0 };
+
+		for (int i = 0; i != orgN; i++) {
+			CompriseInfoArr(organisms[i], infoArr);
+			organisms[i]->MakeDecision(infoArr);
+		}
+
+		ChangeUpdOrder();
+
+		for (int i = 0; i != orgN; i++) {
+			organisms[i]->PosUpd();
+		}
+	}
+
+};
+
+int main(int argc, char* args[]) {
+
+	//System initialization
+	System system = System();
+
+	//Organisms initialization
+	if (RESTART) {
+		ifstream ParametersFile(SAVE_FILE_NAME);
+		string line;
+		float x = 0, y = 0, angleX = 0, v = 0, w = 0;
+		int layer1Line = 0, layer2Line = 0;
+		bool writingSurvivors = false;
+		Organism* tempRead = nullptr;
+
+		for (line; getline(ParametersFile, line);) {
+			istringstream in(line);
+			string type;
+			in >> type;
+
+			if (type == "Layer1") {
+				for (int i = 0; i < tempRead->infoS; i++) {
+					in >> tempRead->layer1->weights[layer1Line][i];
+				}
+				in >> tempRead->layer1->biases[layer1Line];
+				layer1Line++;
+			}
+			else if (type == "Layer2") {
+				for (int i = 0; i < tempRead->innerS; i++) {
+					in >> tempRead->layer2->weights[layer2Line][i];
+				}
+				in >> tempRead->layer2->biases[layer2Line];
+				layer2Line++;
+			}
+			else if (type == "Parameters") {
+				in >> x >> y >> angleX >> v >> w;
+				tempRead = new Organism(ORGANISM_INPUT_SIZE, ORGANISM_INNER_SIZE, ORGANISM_OUTPUT_SIZE, x, y, angleX, v, w);
+			}
+			else if (type == "OrganismEnd") {
+				if (writingSurvivors) {
+					system.survivors.push_back(tempRead);
+					system.survN++;
+				}
+				else {
+					system.organisms.push_back(tempRead);
+					system.orgN++;
+				}
+				tempRead = nullptr;
+				x = 0;
+				y = 0;
+				angleX = 0;
+				v = 0;
+				w = 0;
+				layer1Line = 0;
+				layer2Line = 0;
+			}
+			else if (type == "TickCounter") {
+				in >> tickCnt;
+			}
+			else if (type == "Generation") {
+				in >> system.genCnt;
+			}
+			else if (type == "Survivors") {
+				writingSurvivors = true;
+			}
+		}
+	}
+	else {
+		system.Repopulate();
+	}
+
+
+	//Creating window and renderer
+	SDL_Window* window = nullptr;
+	SDL_Renderer* rend = nullptr;
+	if (SDL_Init(SDL_INIT_VIDEO) < 0) {
+		printf("SDL could not initialize! SDL_Error: %s\n", SDL_GetError());
+		return -1;
+	}
+	window = SDL_CreateWindow("SDL Tutorial", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, WIDTH, HEIGHT, SDL_WINDOW_SHOWN);
+	if (window == nullptr) {
+		printf("Window could not be created! SDL_Error: %s\n", SDL_GetError());
+		return -1;
+	}
+	rend = SDL_CreateRenderer(window, 0, SDL_RENDERER_ACCELERATED);
+
+
+	//Main loop
+	cout << "Generation " << system.genCnt << "\n";
+
+	SDL_Event event;
+	bool quit = false;
+
+	while (not quit) {
+		if (VISUALIZE) {
+
+			//Write down starting time
+			start = chrono::system_clock::now().time_since_epoch() / chrono::milliseconds(1);
+
+			//Check if "close window" button was pressed
+			while (SDL_PollEvent(&event)) {
+				if (event.type == SDL_QUIT) quit = true;
+			}
+
+			//Clear previous window
+			FillScreen(rend, 0, 0, 0);
+
+			//Draw whatever is needed
+			system.Draw(rend);
+
+			//Calculate whatever is needed
+			system.Update();
+			system.CheckSelection();
+
+			//Check if it's time to apply selection
+			tickCnt++;
+			if (tickCnt > GENERATION_LIFETIME or system.survN >= MAX_SURV_N) {
+				tickCnt = 0;
+				system.ApplySelection();
+				cout << "Generation " << system.genCnt << "\n";
+			}
+
+			//Show updates
+			SDL_RenderPresent(rend);
+
+			//Sleep if neccessary
+			tickTime = chrono::system_clock::now().time_since_epoch() / chrono::milliseconds(1) - start;
+			if (tickTime < tickCap) {
+				SDL_Delay(tickCap - tickTime);
+			}
+
+		}
+		else {
+
+			//Check if "close window" button was pressed
+			while (SDL_PollEvent(&event)) {
+				if (event.type == SDL_QUIT) quit = true;
+			}
+
+			//Only calculations
+			system.Update();
+			system.CheckSelection();
+			tickCnt++;
+			if (tickCnt > GENERATION_LIFETIME or system.survN >= MAX_SURV_N) {
+				tickCnt = 0;
+				system.ApplySelection();
+				if (system.genCnt % 100 == 0) {
+					cout << "Generation " << system.genCnt << "\n";
+				}
+			}
+
+		}
+	}
+
+
+	//Destroy window and renderer
+	SDL_DestroyWindow(window);
+	SDL_DestroyRenderer(rend);
+	SDL_Quit();
+
+	//Save parameters if necessary
+	if (SAVE) {
+		Organism* tempSave;
+		ofstream SaveFile(SAVE_FILE_NAME);
+
+		SaveFile << "Generation " << system.genCnt << "\n";
+		SaveFile << "TickCounter " << tickCnt << "\n";
+
+		for (int i = 0; i != system.orgN; i++) {
+			tempSave = system.organisms[i];
+
+			SaveFile << "Parameters " << tempSave->x << " " << tempSave->y << " " << tempSave->angleX << " " << tempSave->v << " " << tempSave->w << " " << "\n";
+
+			for (int i = 0; i < tempSave->innerS; i++) {
+				SaveFile << "Layer1 ";
+				for (int j = 0; j < tempSave->infoS; j++) {
+					SaveFile << tempSave->layer1->weights[i][j] << " ";
+				}
+				SaveFile << tempSave->layer1->biases[i] << "\n";
+			}
+
+			for (int i = 0; i < tempSave->decS; i++) {
+				SaveFile << "Layer2 ";
+				for (int j = 0; j < tempSave->innerS; j++) {
+					SaveFile << tempSave->layer2->weights[i][j] << " ";
+				}
+				SaveFile << tempSave->layer2->biases[i] << "\n";
+			}
+
+			SaveFile << "OrganismEnd\n";
+		}
+
+		SaveFile << "Survivors\n";
+
+		for (int i = 0; i != system.survN; i++) {
+			tempSave = system.survivors[i];
+
+			SaveFile << "Parameters " << tempSave->x << " " << tempSave->y << " " << tempSave->angleX << " " << tempSave->v << " " << tempSave->w << " " << "\n";
+
+			for (int i = 0; i < tempSave->innerS; i++) {
+				SaveFile << "Layer1 ";
+				for (int j = 0; j < tempSave->infoS; j++) {
+					SaveFile << tempSave->layer1->weights[i][j] << " ";
+				}
+				SaveFile << tempSave->layer1->biases[i] << "\n";
+			}
+
+			for (int i = 0; i < tempSave->decS; i++) {
+				SaveFile << "Layer2 ";
+				for (int j = 0; j < tempSave->innerS; j++) {
+					SaveFile << tempSave->layer2->weights[i][j] << " ";
+				}
+				SaveFile << tempSave->layer2->biases[i] << "\n";
+			}
+
+			SaveFile << "OrganismEnd\n";
+		}
+
+		SaveFile.close();
+		cout << "Finished saving" << "\n";
+	}
+
+	return 0;
+}
